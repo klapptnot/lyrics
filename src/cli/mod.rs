@@ -1,19 +1,16 @@
 use crate::any::{
   macros,
-  mxm::{MxmAPI, TrackInfo},
+  mxm::{MxmAPI, TrackItem},
   uagent,
 };
 use clap::Parser;
-use reqwest::header::{HeaderMap, HeaderValue, HeaderName};
+use reqwest::header::{HeaderMap, HeaderValue};
 use std::io::{Read, Write};
 
 #[derive(Parser)]
 struct Args {
-  ///The search query to find the music
+  ///The search query or URL for the music
   query: Vec<String>,
-  ///Url to use instead of searching one
-  #[clap(short = 'u', long = "url", default_value = None)]
-  url: Option<String>,
   ///Timeout timeout in milliseconds
   #[clap(short = 't', long = "timeout", default_value = "5000")]
   timeout: u32,
@@ -32,10 +29,10 @@ struct Args {
   // ///Proxy list file to read from
   // #[clap(short = 'P', long = "proxylist", default_value = None)]
   // proxylist: Option<String>,
-  // ///Cookie string for musixmatch to bypass captcha
-  // #[clap(short = 'm', long = "mxm-cookies", default_value = None)]
-  // mxm_cookie: Option<String>,
   // ---------------------------------------
+  ///Cookie string for Google
+  #[clap(short = 'C', long = "ggl-cookies", default_value = None)]
+  ggl_cookie: Option<String>,
   ///User agent string
   #[clap(short = 'U', long = "user-agent", default_value = None)]
   user_agent: Option<String>,
@@ -53,15 +50,22 @@ struct Args {
   repeat: bool,
 }
 
+macro_rules! header_add {
+  ($headers:expr, $name:expr, $value:expr) => {
+    $headers.insert(
+      ::reqwest::header::HeaderName::from_static($name),
+      ::reqwest::header::HeaderValue::from_static($value).into(),
+    );
+  };
+}
+
 /// The CLI functionality
 pub fn cli() {
   let args = Args::parse();
 
   // Parse some command line arguments items as groups
-  if args.query.len() < 1 && args.url.is_none() {
+  if args.query.len() < 1 {
     macros::exit_err!("You must specify a url or query to get a url");
-  } else if !args.query.len() < 1 && !args.url.is_none() {
-    macros::exit_err!("Cannot specify a url and query at the same time");
   }
 
   if args.tries == 0 {
@@ -78,64 +82,72 @@ pub fn cli() {
     );
   }
 
-  headers.insert(reqwest::header::ACCEPT, HeaderValue::from_static("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"));
-  headers.insert(reqwest::header::ACCEPT_LANGUAGE, HeaderValue::from_static("en-US,en;q=0.5"));
-  headers.insert(reqwest::header::ACCEPT_ENCODING, HeaderValue::from_static("gzip, deflate"));
+  if let Some(v) = args.ggl_cookie {
+    headers.insert(reqwest::header::COOKIE, v.parse().unwrap());
+  }
+
+  headers.insert(
+    reqwest::header::ACCEPT,
+    HeaderValue::from_static("text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"),
+  );
+  headers.insert(
+    reqwest::header::ACCEPT_LANGUAGE,
+    HeaderValue::from_static("en-US,en"),
+  );
+  headers.insert(
+    reqwest::header::ACCEPT_ENCODING,
+    HeaderValue::from_static("gzip, deflate"),
+  );
   headers.insert(reqwest::header::DNT, HeaderValue::from_static("1"));
-  headers.insert(reqwest::header::CONNECTION, HeaderValue::from_static("disconnect"));
-  headers.insert(reqwest::header::UPGRADE_INSECURE_REQUESTS, HeaderValue::from_static("1"));
-  headers.insert(HeaderName::from_static("sec-gpc"), HeaderValue::from_static("1").into());
-  headers.insert(HeaderName::from_static("sec-fetch-dest"), HeaderValue::from_static("document").into());
-  headers.insert(HeaderName::from_static("sec-fetch-mode"), HeaderValue::from_static("navigate").into());
-  headers.insert(HeaderName::from_static("sec-fetch-site"), HeaderValue::from_static("none").into());
-  headers.insert(HeaderName::from_static("sec-fetch-user"), HeaderValue::from_static("?1").into());
-  headers.insert(HeaderName::from_static("priority"), HeaderValue::from_static("u=0, i").into());
+  headers.insert(
+    reqwest::header::CONNECTION,
+    HeaderValue::from_static("disconnect"),
+  );
+  headers.insert(
+    reqwest::header::UPGRADE_INSECURE_REQUESTS,
+    HeaderValue::from_static("1"),
+  );
+
+  let additional_headers = [
+    ("rtt", "150"),
+    ("sec-ch-prefers-color-scheme", "dark"),
+    ("sec-ch-ua-arch", "\"x86\""),
+    ("sec-ch-ua-bitness", "\"64\""),
+    ("sec-ch-ua-form-factors", "\"Desktop\""),
+    ("sec-ch-ua-mobile", "?0"),
+    ("sec-ch-ua-model", "\"\""),
+    ("sec-ch-ua-platform-version", "\"6.15.5\""),
+    ("sec-ch-ua-wow64", "?0"),
+    ("sec-fetch-dest", "document"),
+    ("sec-fetch-mode", "navigate"),
+    ("sec-fetch-site", "same-origin"),
+    ("sec-fetch-user", "?1"),
+    ("sec-gpc", "1"),
+    ("x-browser-channel", "stable"),
+    ("x-browser-year", "2025"),
+  ];
+
+  for (key, value) in additional_headers.iter() {
+    header_add!(headers, key, value);
+  }
 
   let mxm_api = MxmAPI::new(args.tries, args.timeout, Some(headers));
-  let track: TrackInfo;
-
-  if !args.url.is_none() {
-    track = mxm_api.get_from_url(&args.url.unwrap());
-  } else {
-    let kwds = args
-      .query
-      .iter()
-      .map(|e| e.as_str())
-      .collect::<Vec<&str>>()
-      .join(" ");
-
-    if !args.typ_url {
-      track = mxm_api.get_track_info(&kwds, args.url_index);
+  let track = {
+    if args.query.len() > 0 && crate::any::mxm::is_musixmatch_url(&args.query[0]) {
+      mxm_api.get_from_url(&args.query[0])
     } else {
+      let kwds = args.query.join(" ");
+
       let urls = mxm_api.get_possible_links(&kwds);
-      println!("\x1b[38;2;195;79;230mAvailable options are:\x1b[0m");
-      for i in 0..urls.len() {
-        println!(
-        "  {} \x1b[38;2;255;169;140m-> \x1b[38;2;255;232;184m{}\n    \x1b[38;2;195;79;230mAt: \x1b[38;2;189;147;249m{}\x1b[0m",
-        i, urls[i].desc, urls[i].url
-      );
-      }
-      print!("\x1b[38;2;195;79;230mSelect one from above:\x1b[0m ");
-      std::io::stdout().flush().unwrap();
-      let mut idx: [u8; 1] = [48];
-      std::io::stdin()
-        .read_exact(&mut idx)
-        .expect("Could not read the input");
-
-      // Ascii(48-57) == Ordinal(0-9)
-      if idx[0] > 57 || idx[0] < 48 {
-        macros::exit_err!("Invalid input, select a number");
-      }
-
-      let idx: usize = (idx[0] - 48) as usize;
-
-      track = if let Some(u) = &urls.get(idx) {
-        mxm_api.get_from_url(&u.url)
+      let picked = if args.typ_url {
+        pick_url(&urls)
       } else {
-        macros::exit_err!("Index {idx} is out of bounds");
+        urls.get(0).unwrap()
       };
+
+      mxm_api.get_from_url(&picked.url)
     }
-  }
+  };
 
   // let track = TrackInfo::from(crate::dummy::get_json()).unwrap_or_else(|| macros::exit_err("Not able to get TrackInfo"));
 
@@ -205,4 +217,31 @@ pub fn cli() {
   }
   // For now, it has a trailing '\n'
   print!("Copyright -> {}", track.lyrics_copyright);
+}
+
+fn pick_url(urls: &Vec<TrackItem>) -> &TrackItem {
+  println!("\x1b[38;2;195;79;230mAvailable options are:\x1b[0m");
+  for i in 0..urls.len() {
+    println!(
+      "  {} \x1b[38;2;255;169;140m-> \x1b[38;2;255;232;184m{}\n    \x1b[38;2;195;79;230mAt: \x1b[38;2;189;147;249m{}\x1b[0m",
+      i, urls[i].desc, urls[i].url
+    );
+  }
+  print!("\x1b[38;2;195;79;230mSelect one from above:\x1b[0m ");
+  std::io::stdout().flush().unwrap();
+  let mut idx: [u8; 1] = [48];
+  std::io::stdin()
+    .read_exact(&mut idx)
+    .expect("Could not read the input");
+
+  // Ascii(48-57) == Ordinal(0-9)
+  if idx[0] > 57 || idx[0] < 48 {
+    macros::exit_err!("Invalid input, select a number");
+  }
+
+  let idx: usize = (idx[0] - 48) as usize;
+
+  urls.get(idx).unwrap_or_else(|| {
+    macros::exit_err!("Index {idx} is out of bounds");
+  })
 }

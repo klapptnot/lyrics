@@ -1,4 +1,3 @@
-use fancy_regex::Regex;
 use reqwest::header::HeaderMap;
 use serde_json::Value;
 use std::time::Duration;
@@ -42,7 +41,6 @@ impl LyricParagraph {
 }
 
 /// Trying to not have this in main.rs, here is it
-#[allow(dead_code)]
 pub(crate) struct TrackInfo {
   /// Song title
   pub(crate) name: String,
@@ -55,6 +53,7 @@ pub(crate) struct TrackInfo {
   /// Whether song has lyrics structure or not
   pub(crate) has_lyrics_struct: bool,
   /// Lyrics (full) language name
+  #[allow(dead_code)]
   pub(crate) lyrics_lang: String,
   /// The lyrics as string (escaped)
   pub(crate) lyrics: String,
@@ -161,8 +160,11 @@ impl MxmAPI {
     let mut spinner = Spinner::new();
     spinner.start("Getting song data".into());
 
+    let mut headers = self.headers.clone().unwrap_or(HeaderMap::new());
+    headers.insert("cookies", reqwest::header::HeaderValue::from_static("").into());
+
     for i in 1..=self.tries {
-      if let Ok(json_str) = get_json(&url, self.timeout, self.headers.clone()) {
+      if let Ok(json_str) = get_json(&url, self.timeout, headers.clone()) {
         mxm_json = Some(json_str);
         break;
       } else {
@@ -171,21 +173,15 @@ impl MxmAPI {
     }
 
     spinner.stop();
-    let mxm_json: String = mxm_json.unwrap_or_else(|| {
+    let Some(mxm_json) = mxm_json else {
       macros::exit_err!("Couldn't get a (valid) response from the server");
-    });
-    let track = TrackInfo::from(mxm_json).unwrap_or_else(|| {
+    };
+
+    let Some(track) = TrackInfo::from(mxm_json) else {
       macros::exit_err!("Couldn't read json from response");
-    });
+    };
 
     track
-  }
-
-  pub fn get_track_info(&self, keyword: &String, index: usize) -> TrackInfo {
-    let uti = self.get_possible_links(keyword);
-    let uti = uti.get(index).unwrap();
-
-    MxmAPI::get_from_url(&self, &uti.url)
   }
 
   pub fn get_possible_links(&self, keyword: &String) -> Vec<TrackItem> {
@@ -249,37 +245,22 @@ pub fn get_urls(keyword: &String, timeout: u32, headers_map: Option<HeaderMap>) 
     return Err(ResponseErr::Captcha);
   }
 
-  let url_list: Vec<String> = Regex::new(r#"(?<=><a jsname="UWckNb" href=")[^ ]*(?=")"#)
-    .unwrap()
-    .find_iter(response.as_str())
-    .map(|m| String::from(m.unwrap().as_str()))
-    .collect();
-
-  if url_list.len() == 0 {
-    return Err(ResponseErr::NoEnoughData);
-  }
-
-  let url_desc: Vec<String> = Regex::new(r#"(?<=<br><h3 class="LC20lb MBeuO DKV0Md">)[^<]*(?=<)"#)
-    .unwrap()
-    .find_iter(response.as_str())
-    .map(|m| String::from(m.unwrap().as_str()))
-    .collect();
+  let (url_list, url_desc) = parse_search_results(&response)?;
 
   let mut urls_tp: Vec<TrackItem> = Vec::new();
-  let tr_re = Regex::new(r"/translation/.*$").unwrap();
 
   // Add all not translation URLs
   for i in 0..url_list.len() {
-    if tr_re.is_match(url_list[i].as_str()).unwrap() {
-      let uns_url = String::from(tr_re.replace(url_list[i].as_str(), ""));
+    if let Some(tpos) = url_list[i].find("/translation/") {
+      let uns_url = &url_list[i][0..tpos];
       if url_list.contains(&uns_url) {
         continue;
       }
-      urls_tp.push(TrackItem::new(uns_url, String::from(&url_desc[i])))
+      urls_tp.push(TrackItem::new(uns_url.to_string(), url_desc[i].to_string()))
     } else {
       urls_tp.push(TrackItem::new(
-        String::from(&url_list[i]),
-        String::from(&url_desc[i]),
+        String::from(url_list[i]),
+        String::from(url_desc[i]),
       ))
     }
   }
@@ -287,36 +268,117 @@ pub fn get_urls(keyword: &String, timeout: u32, headers_map: Option<HeaderMap>) 
   Ok(urls_tp)
 }
 
-fn get_json(url: &String, timeout: u32, headers_map: Option<HeaderMap>) -> Result<String, String> {
-  let r_url = Regex::new(r#"^https?://(?:www\.)?musixmatch\.com/"#).unwrap();
-  if !r_url.is_match(&url.as_str()).unwrap_or(false) {
-    // URL must be valid (i.e. not empty, from musixmatch)
+fn get_json(url: &String, timeout: u32, headers_map: HeaderMap) -> Result<String, String> {
+  if !is_musixmatch_url(&url) {
     return Err("Invalid URL".into());
   }
 
-  let client = reqwest::blocking::Client::new()
+  let client = reqwest::blocking::Client::builder()
+    .gzip(true)
+    .build()
+    .unwrap_or_else(|e| {
+      macros::exit_err!("Could not create a client: {e}");
+    });
+
+  let response = client
     .get(url)
     .timeout(Duration::from_millis(timeout as u64))
-    .headers(headers_map.unwrap_or(HeaderMap::new()));
+    .headers(headers_map)
+    .send()
+    .unwrap_or_else(|e| {
+      macros::exit_err!("Could send request: {e}");
+    });
 
-  let response: reqwest::blocking::Response;
-  let res = client.send();
-  response = match res {
-    Err(_) => return Err("Something went wrong".into()),
-    Ok(data) => data,
-  };
-
-  let response = response.text().unwrap_or_else(|e| {
+  let html_str = response.text().unwrap_or_else(|e| {
     macros::exit_err!("Could not get response content: {e}");
   });
-  let json_res = Regex::new(r#"(?<=<script id="__NEXT_DATA__" type=\"application/json">).*(?=</script>)"#)
-    .unwrap()
-    .find(response.as_str())
-    .unwrap();
 
-  if json_res.is_none() {
-    return Err("Invalid response structure".into());
+  let json_str = extract_between(
+    &html_str,
+    r#"<script id="__NEXT_DATA__" type="application/json">"#,
+    r#"</script>"#,
+  );
+
+  println!("{json_str:#?}");
+
+  if let Some(v) = json_str {
+    return Ok(v.into());
   }
 
-  return Ok(json_res.unwrap().as_str().into());
+  return Err("Invalid response structure".into());
+}
+
+fn extract_between<'a>(text: &'a str, start: &str, end: &str) -> Option<&'a str> {
+  let start_pos = text.find(start)? + start.len();
+  println!("\n{}", &text[start_pos - start.len()..start_pos]);
+  let end_pos = text[start_pos..].find(end)?;
+  Some(&text[start_pos..start_pos + end_pos])
+}
+
+fn parse_search_results(response: &str) -> Result<(Vec<&str>, Vec<&str>), ResponseErr> {
+  if !response.contains(r#"<a jsname="UWckNb" class="VfSr4c" href=""#) {
+    return Err(ResponseErr::NoEnoughData);
+  }
+
+  let mut url_list = Vec::new();
+  let mut search_pos = 0;
+
+  while let Some(link_start) = response[search_pos..].find(r#"<a jsname="UWckNb" class="VfSr4c" href=""#) {
+    let absolute_pos = search_pos + link_start;
+    if let Some(url) = extract_between(&response[absolute_pos..], r#"href=""#, r#"""#) {
+      url_list.push(url);
+    }
+    search_pos = absolute_pos + 1;
+  }
+
+  if url_list.is_empty() {
+    return Err(ResponseErr::NoEnoughData);
+  }
+
+  let mut url_desc = Vec::new();
+
+  search_pos = 0;
+
+  while let Some(desc_start) = response[search_pos..].find(r#"<br><h3 class="LC20lb MBeuO DKV0Md">"#) {
+    let absolute_pos = search_pos + desc_start;
+    if let Some(desc) = extract_between(
+      &response[absolute_pos..],
+      r#"<h3 class="LC20lb MBeuO DKV0Md">"#,
+      "<",
+    ) {
+      url_desc.push(desc);
+    }
+    search_pos = absolute_pos + 1;
+  }
+
+  Ok((url_list, url_desc))
+}
+
+pub(crate) fn is_musixmatch_url(url: &str) -> bool {
+  let mut idx = 0;
+
+  if !url[idx..].starts_with("http") {
+    return false;
+  }
+  idx += 4;
+
+  if url[idx..].starts_with("s") {
+    idx += 1;
+  }
+
+  if !url[idx..].starts_with("://") {
+    return false;
+  }
+  idx += 3;
+
+  if url[idx..].starts_with("www.") {
+    idx += 4;
+  }
+
+  if !url[idx..].starts_with("musixmatch.com/lyrics/") {
+    return false;
+  }
+  idx += 22;
+
+  url[idx..].len() > 0
 }
